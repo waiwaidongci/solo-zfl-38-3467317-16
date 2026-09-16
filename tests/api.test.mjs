@@ -93,8 +93,10 @@ test("登记：成功、重复索号冲突、同人职责分离被拒", async ()
 
 test("循环序号：必须递增，重复/跳号/缺序号被拒；累计滑移必须不减", async () => {
   const rope = await register();
-  // 不带 expectedSeq
-  assert.equal((await req("POST", `/api/ropes/${rope.id}/cycles`, { loadN: 400, tailSlipMm: 2 })).status, 409);
+  // 不带 expectedSeq：明确的客户端错误（400），不是序号冲突
+  const noSeq = await req("POST", `/api/ropes/${rope.id}/cycles`, { loadN: 400, tailSlipMm: 2 });
+  assert.equal(noSeq.status, 400);
+  assert.equal(noSeq.json.error, "invalid_cycle");
   // 跳号：第一条就报 3
   let r = await req("POST", `/api/ropes/${rope.id}/cycles`, { expectedSeq: 3, loadN: 400, tailSlipMm: 2 });
   assert.equal(r.status, 409);
