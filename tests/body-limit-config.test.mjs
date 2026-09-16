@@ -7,12 +7,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApp, ConfigError } from "../lib/app.js";
 
-// —— 稳健性要点（Node 20/22 通用）——
-// 1) 每个 app 配独立 Agent（keepAlive 由我们掌控），并登记全部 app，收尾统一
-//    destroy agent + server.closeAllConnections，避免空闲套接字让 server.close 挂住。
-// 2) 提前 413 + 服务端关闭连接时，客户端可能在读完响应后还收到 socket error
-//    （ECONNRESET/EPIPE 等）；一旦已读到完整状态行与响应体，就视为正常分支，
-//    丢弃随后的错误，状态与响应体都保留。
+// —— 严格发送与收尾（Node 20/22 通用）——
+// postStrict：客户端必须收到完整状态行与响应体；任何在响应读完之前发生的传输
+// 错误都让用例失败，绝不把“没收到响应”当作提前关闭放行。发送体时一旦响应开始
+// 到达就停止发送（服务端会停止读取并在极短窗口后关连），避免无谓的写错误掩盖响应。
+// 每个 app 用独立 Agent，收尾 destroy agent + closeAllConnections + close，自然退出。
 let rootDir;
 const apps = [];
 
@@ -24,7 +23,7 @@ async function freshPath() {
 async function startApp(opts = {}) {
   const app = createApp({ dbPath: await freshPath(), ...opts });
   await new Promise((r) => app.server.listen(0, r));
-  app.agent = new Agent({ keepAlive: true }); // 独立连接池，收尾时销毁
+  app.agent = new Agent({ keepAlive: true });
   apps.push(app);
   return app;
 }
@@ -32,8 +31,8 @@ async function startApp(opts = {}) {
 async function stopApp(app) {
   if (!app || app._closed) return;
   app._closed = true;
-  app.agent?.destroy(); // 关闭本 app 的客户端 keep-alive 连接池
-  app.server.closeAllConnections?.(); // 释放服务端残留连接，避免 close() 挂住
+  app.agent?.destroy();
+  app.server.closeAllConnections?.();
   await new Promise((r) => app.server.close(r));
 }
 
@@ -59,52 +58,80 @@ function withEnv(env, fn) {
     });
 }
 
-// 发起 POST：正常返回 {status,json,body,closed}；
-// 若服务端提前关连导致“响应之后”的 socket 错误，仍返回已读到的响应。
-// 仅当在收到任何响应字节前就失败，才返回 {transportError}。
-function post(app, path, payload, { headers = {} } = {}) {
+// 严格 POST：要么拿到完整响应，要么明确失败（reject）。
+function postStrict(app, path, payload) {
   const port = app.server.address().port;
-  const body = payload === undefined ? undefined : Buffer.from(payload);
-  return new Promise((resolve) => {
+  const body = payload === undefined ? Buffer.alloc(0) : Buffer.from(payload);
+  return new Promise((resolve, reject) => {
     const creq = http.request(
       {
         port,
         path,
         method: "POST",
         agent: app.agent,
-        headers: { "Content-Type": "application/json", ...headers, ...(body ? { "Content-Length": body.length } : {}) },
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": body.length,
+        },
       },
       (res) => {
         const chunks = [];
-        let complete = false;
+        let settled = false;
+        const fail = (why) => {
+          if (settled) return;
+          settled = true;
+          reject(new Error(`未读到完整响应即连接中断：${why}（已收 ${Buffer.concat(chunks).length} 字节，状态 ${res.statusCode ?? "?"}）`));
+        };
         res.on("data", (d) => chunks.push(d));
-        const finish = () => {
-          if (complete) return;
-          complete = true;
+        res.on("end", () => {
+          if (settled) return;
+          settled = true;
           const raw = Buffer.concat(chunks).toString("utf8");
           let json = {};
           try {
             json = raw ? JSON.parse(raw) : {};
-          } catch {}
-          resolve({
-            status: res.statusCode,
-            connection: res.headers.connection,
-            body: raw,
-            json,
-          });
-        };
-        res.on("end", finish);
-        // 响应已结束后连接被销毁：不影响结论
-        res.on("error", () => finish());
-        res.on("aborted", finish);
+          } catch {
+            return reject(new Error(`响应体不是合法 JSON：${raw.slice(0, 120)}`));
+          }
+          resolve({ status: res.statusCode, connection: res.headers.connection, body: raw, json });
+        });
+        // 响应体未读完就出错/中断：必须失败，不能放行
+        res.on("error", (e) => fail(e.code || e.message));
+        res.on("aborted", () => fail("response aborted"));
       }
     );
-    creq.on("error", (err) => {
-      // 在拿到响应前连接就被重置：交给调用方按“提前关闭”分支处理
-      resolve({ transportError: err.code || err.message });
-    });
-    if (body) creq.end(body);
-    else creq.end();
+    creq.on("error", (e) => reject(new Error(`请求在收到响应前失败：${e.code || e.message}`)));
+
+    if (body.length === 0) {
+      creq.end();
+      return;
+    }
+    // 分块发送：一旦服务端开始回 413（连接变可写/响应排队），尽快 end，停止灌入剩余数据，
+    // 让客户端专注读响应；但即便仍有未发字节，也必须已读到完整响应才算通过。
+    let offset = 0;
+    const CHUNK = 4096;
+    const pump = () => {
+      if (creq.destroyed || creq.writableEnded) return;
+      offset += CHUNK;
+      if (offset >= body.length) {
+        creq.end(body.subarray(offset - CHUNK));
+        return;
+      }
+      const ok = creq.write(body.subarray(offset - CHUNK, offset));
+      if (!ok) creq.once("drain", pump);
+      else setImmediate(pump);
+    };
+    pump();
+  });
+}
+
+async function getStatus(app, path) {
+  return new Promise((resolve, reject) => {
+    http.get({ port: app.server.address().port, path, agent: app.agent }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(res.statusCode));
+      res.on("error", reject);
+    }).on("error", reject);
   });
 }
 
@@ -121,21 +148,15 @@ const VALID_REG = JSON.stringify({
   inspectorName: "乙",
 });
 
-// 413 可能伴随传输层重置：接受“完整 413”或“响应前连接关闭”，但二者都必须无新增写入
-async function assertTooLargeOrEarlyClose(app, r, { before = app.store.db.ropes.length } = {}) {
-  if (r.transportError) {
-    // 响应前连接即被终止：是“提前关闭”的极端时序，属正常分支；真正要保证的是无写入与可用
-    assert.equal(typeof r.transportError, "string");
-  } else {
-    assert.equal(r.status, 413, `应 413，实际 ${r.status} ${r.body}`);
-    assert.equal(r.json.error, "payload_too_large");
-  }
-  assert.equal(app.store.db.ropes.length, before, "超限请求不得新增写入");
-  // 服务继续可用（新连接发小请求）
-  const alive = await new Promise((resolve) =>
-    http.get({ port: app.server.address().port, path: "/api/knots", agent: app.agent }, (x) => resolve(x.statusCode)).on("error", () => resolve(0))
-  );
-  assert.equal(alive, 200, "服务必须继续可用");
+// 严格断言：必须是完整 413 + 稳定错误体；然后零新增写入、服务可用
+async function assertStrict413(app, r) {
+  assert.equal(r.status, 413, `应收到完整 413，实际 ${r.status} ${r.body}`);
+  assert.equal(r.connection, "close");
+  assert.equal(r.json.error, "payload_too_large");
+  assert.equal(typeof r.json.limitBytes, "number");
+  assert.ok(r.body.includes("请求体超过"));
+  assert.equal(app.store.db.ropes.length, app._beforeCount ?? app.store.db.ropes.length, "超限请求不得新增写入");
+  assert.equal(await getStatus(app, "/api/knots"), 200, "服务必须继续可用");
 }
 
 test("无效 option：NaN/Infinity/负数/小数/字符串/布尔/超范围 在启动期抛 ConfigError", () => {
@@ -162,59 +183,54 @@ test("合法 option 边界：0 与 MAX_SAFE_INTEGER 均可启动并正常停止"
   await stopApp(zero);
   const max = await startApp({ maxBodyBytes: Number.MAX_SAFE_INTEGER });
   await stopApp(max);
-  zero._closed && max._closed && assert.ok(true);
+  assert.ok(zero._closed && max._closed);
 });
 
-test("上限为 0：有字节请求体 413（或提前关闭），空体正常进入校验返回 400", async () => {
+test("上限为 0：有字节请求体必须返回完整 413；空体正常进入校验返回 400", async () => {
   const app = await startApp({ maxBodyBytes: 0 });
-  const withBody = await post(app, "/api/ropes", VALID_REG);
-  await assertTooLargeOrEarlyClose(app, withBody);
-  const empty = await post(app, "/api/ropes", "");
+  app._beforeCount = 0;
+  const withBody = await postStrict(app, "/api/ropes", VALID_REG);
+  await assertStrict413(app, withBody);
+  const empty = await postStrict(app, "/api/ropes", "");
   assert.equal(empty.status, 400, `空体应进入类型校验 400，实际 ${empty.status}`);
 });
 
-test("合法数字 option 生效：恰在上限内 201，超过 413（或提前关闭），服务继续可用", async () => {
+test("合法数字 option：恰在上限内 201，超过必须返回完整 413，服务继续可用", async () => {
   const len = Buffer.byteLength(VALID_REG);
   const app = await startApp({ maxBodyBytes: len });
-  const exact = await post(app, "/api/ropes", VALID_REG);
-  assert.equal(exact.status, 201, `恰好 ${len} 字节应接受：${exact.status} ${exact.body || exact.transportError}`);
-  const over = await post(app, "/api/ropes", VALID_REG.replace('"R-C"', '"R-C2"'));
-  await assertTooLargeOrEarlyClose(app, over);
+  const exact = await postStrict(app, "/api/ropes", VALID_REG);
+  assert.equal(exact.status, 201, `恰好 ${len} 字节应接受：${exact.status} ${exact.body}`);
+  app._beforeCount = 1; // 上面合法登记已写入一条
+  const overBody = VALID_REG.replace('"R-C"', '"R-C2"');
+  const over = await postStrict(app, "/api/ropes", overBody);
+  await assertStrict413(app, over);
 });
 
-test("环境变量整数生效且优先于默认；显式 option 优先于环境变量", async () => {
+test("环境变量整数生效：超限必须完整 413；显式 option 覆盖环境变量后接受", async () => {
   await withEnv({ KNOT_MAX_BODY_BYTES: "10" }, async () => {
     const app = await startApp();
-    const r = await post(app, "/api/ropes", VALID_REG);
-    await assertTooLargeOrEarlyClose(app, r);
+    app._beforeCount = 0;
+    const r = await postStrict(app, "/api/ropes", VALID_REG);
+    await assertStrict413(app, r);
     await stopApp(app);
   });
   await withEnv({ KNOT_MAX_BODY_BYTES: "10" }, async () => {
     const app = await startApp({ maxBodyBytes: 1 << 20 });
-    const r = await post(app, "/api/ropes", VALID_REG);
-    assert.equal(r.status, 201, `大 option 覆盖小 env，应接受：${r.status} ${r.transportError || ""}`);
+    const r = await postStrict(app, "/api/ropes", VALID_REG);
+    assert.equal(r.status, 201, `大 option 覆盖小 env，应接受：${r.status} ${r.body}`);
     await stopApp(app);
   });
 });
 
-test("未配置时默认 1MiB：普通请求 201，明显超过 413（或提前关闭）且只写入合法那条", async () => {
+test("未配置时默认 1MiB：普通请求 201；超大请求必须完整 413，只写入合法那条", async () => {
   await withEnv({ KNOT_MAX_BODY_BYTES: undefined }, async () => {
     const app = await startApp();
-    const ok = await post(app, "/api/ropes", VALID_REG);
-    assert.equal(ok.status, 201, `普通请求应 201：${ok.status} ${ok.body || ""}`);
-    const hugePayload = JSON.stringify({ ropeNo: "R-HUGE", pad: "z".repeat(1024 * 1024 + 50) });
-    const huge = await post(app, "/api/ropes", hugePayload);
-    if (huge.transportError) {
-      assert.equal(typeof huge.transportError, "string"); // 提前关闭的极端时序
-    } else {
-      assert.equal(huge.status, 413, `超大请求应 413：${huge.status} ${huge.body}`);
-      assert.equal(huge.json.error, "payload_too_large");
-    }
+    const ok = await postStrict(app, "/api/ropes", VALID_REG);
+    assert.equal(ok.status, 201, `普通请求应 201：${ok.status} ${ok.body}`);
+    app._beforeCount = 1;
+    const huge = await postStrict(app, "/api/ropes", JSON.stringify({ ropeNo: "R-HUGE", pad: "z".repeat(1024 * 1024 + 50) }));
+    await assertStrict413(app, huge);
     assert.equal(app.store.db.ropes.length, 1, "超大请求不写入，仅保留合法 1 条");
-    const alive = await new Promise((resolve) =>
-      http.get({ port: app.server.address().port, path: "/api/knots", agent: app.agent }, (x) => resolve(x.statusCode)).on("error", () => resolve(0))
-    );
-    assert.equal(alive, 200, "服务必须继续可用");
   });
 });
 
