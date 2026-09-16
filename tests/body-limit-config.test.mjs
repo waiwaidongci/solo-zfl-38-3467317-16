@@ -63,6 +63,8 @@ function postStrict(app, path, payload) {
   const port = app.server.address().port;
   const body = payload === undefined ? Buffer.alloc(0) : Buffer.from(payload);
   return new Promise((resolve, reject) => {
+    let responseSeen = false;
+    let responseEnded = false;
     const creq = http.request(
       {
         port,
@@ -75,10 +77,11 @@ function postStrict(app, path, payload) {
         },
       },
       (res) => {
+        responseSeen = true;
         const chunks = [];
         let settled = false;
         const fail = (why) => {
-          if (settled) return;
+          if (settled || responseEnded) return;
           settled = true;
           reject(new Error(`未读到完整响应即连接中断：${why}（已收 ${Buffer.concat(chunks).length} 字节，状态 ${res.statusCode ?? "?"}）`));
         };
@@ -86,6 +89,7 @@ function postStrict(app, path, payload) {
         res.on("end", () => {
           if (settled) return;
           settled = true;
+          responseEnded = true;
           const raw = Buffer.concat(chunks).toString("utf8");
           let json = {};
           try {
@@ -100,24 +104,29 @@ function postStrict(app, path, payload) {
         res.on("aborted", () => fail("response aborted"));
       }
     );
-    creq.on("error", (e) => reject(new Error(`请求在收到响应前失败：${e.code || e.message}`)));
+    // 请求侧错误：只有在尚未收到完整响应时才判失败；响应结束后的写错误（攻击端
+    // 未发完的 body 触发 EPIPE/RST）不影响“客户端已读完 413”这一事实。
+    creq.on("error", (e) => {
+      if (!responseEnded) reject(new Error(`请求在收到完整响应前失败：${e.code || e.message}`));
+    });
 
     if (body.length === 0) {
       creq.end();
       return;
     }
-    // 分块发送：一旦服务端开始回 413（连接变可写/响应排队），尽快 end，停止灌入剩余数据，
-    // 让客户端专注读响应；但即便仍有未发字节，也必须已读到完整响应才算通过。
+    // 分块发送：服务端一开始回响应就停止灌入剩余数据，专注读完响应，
+    // 避免无谓写错误掩盖响应；但通过条件始终是“读完完整响应”。
     let offset = 0;
     const CHUNK = 4096;
     const pump = () => {
-      if (creq.destroyed || creq.writableEnded) return;
+      if (creq.destroyed || creq.writableEnded || responseSeen) return;
+      const start = offset;
       offset += CHUNK;
       if (offset >= body.length) {
-        creq.end(body.subarray(offset - CHUNK));
+        creq.end(body.subarray(start));
         return;
       }
-      const ok = creq.write(body.subarray(offset - CHUNK, offset));
+      const ok = creq.write(body.subarray(start, offset));
       if (!ok) creq.once("drain", pump);
       else setImmediate(pump);
     };
