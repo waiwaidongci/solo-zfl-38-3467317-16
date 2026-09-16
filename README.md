@@ -11,6 +11,10 @@ DB_PATH=/tmp/k.json npm start
 ```
 
 数据以原子写（临时文件 + rename）保存在 `data/knot-acceptance.json`，重启后仍在。
+写临时文件或改名任一步失败，都会清掉**本次**临时文件、原库字节不变、内存回滚；
+启动时只按本库文件名前缀清理遗留临时文件，不碰同目录其他数据库。
+持久化失败时客户端只收到稳定错误码（`persist_failed`，`reason` 为
+`write_failed`/`rename_failed`）与简短中文说明，绝对路径与系统错误仅写服务端日志。
 
 ## 验收规则（lib/knots.js）
 
@@ -42,7 +46,7 @@ DB_PATH=/tmp/k.json npm start
 ## 测试
 
 ```bash
-npm test                  # 40 个 node:test：领域判定 + API/并发/回滚/持久化 + 严格入参 + 编号冲突
+npm test                  # 46 个 node:test：判定/并发/回滚/持久化/严格入参/编号冲突/原子写失败
 npm run test:browser      # Playwright 真实浏览器走查（7 项）
 ```
 
