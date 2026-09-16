@@ -42,7 +42,7 @@ DB_PATH=/tmp/k.json npm start
 ## 测试
 
 ```bash
-npm test                  # 33 个 node:test：领域判定 + API/并发/回滚/持久化 + 严格入参校验
+npm test                  # 40 个 node:test：领域判定 + API/并发/回滚/持久化 + 严格入参 + 编号冲突
 npm run test:browser      # Playwright 真实浏览器走查（7 项）
 ```
 
@@ -66,11 +66,18 @@ npm run test:browser      # Playwright 真实浏览器走查（7 项）
 
 ## API
 
+写接口（循环 / 定案 / 批量）路径参数一律使用服务端生成的**内部编号 `id`** 精确定位，
+绝不回退到自定义索号：若路径值是某根索的索号，返回 **400 `use_internal_id`**
+（未知编号则 404），避免“索号恰等于另一根索内部编号”时写错对象。
+登记时若新索号等于任何已有内部编号，返回 **409 `rope_no_matches_internal_id`**。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/knots` | 结型库与限值 |
 | GET | `/api/ropes` | 绳索列表（含实时判定预览） |
-| POST | `/api/ropes` | 成型登记（重复索号 409） |
-| POST | `/api/ropes/:id/cycles` | 追加循环（body 须带 `expectedSeq`） |
-| POST | `/api/ropes/:id/confirm` | 验收员签名定案（不可覆盖） |
-| POST | `/api/ropes/batch-confirm` | 批量定案（失败整批回滚） |
+| GET | `/api/ropes/:id` | 按**内部编号**精确读取（是索号时返回 400 指引） |
+| GET | `/api/ropes/by-rope-no/:ropeNo` | 明确按**索号**查询 |
+| POST | `/api/ropes` | 成型登记（索号重复 / 占用内部编号均 409） |
+| POST | `/api/ropes/:id/cycles` | 按内部编号追加循环（body 须带 `expectedSeq`） |
+| POST | `/api/ropes/:id/confirm` | 按内部编号，验收员签名定案（不可覆盖） |
+| POST | `/api/ropes/batch-confirm` | `ids` 必须全部是内部编号；非法编号 400，状态冲突 409 整批回滚 |

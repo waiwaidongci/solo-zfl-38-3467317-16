@@ -214,15 +214,24 @@ test("批量确认：任一不满足则整批中止，不留半批记录", async
   const first = await req("POST", `/api/ropes/${locked.id}/confirm`, { inspectorName: "李四" });
   assert.equal(first.status, 201);
 
+  // 批次含未知编号：在状态检查前即明确 400，且不改动任何索
+  const missing = await req("POST", "/api/ropes/batch-confirm", {
+    ids: [good1.id, "missing-id"],
+    inspectorName: "李四",
+  });
+  assert.equal(missing.status, 400);
+  assert.equal(missing.json.error, "invalid_batch_ids");
+
+  // 批次含已定案索 / 他人验收索：整批 409 中止
   const r = await req("POST", "/api/ropes/batch-confirm", {
-    ids: [good1.id, locked.id, otherInspector.id, good2.id, "missing-id"],
+    ids: [good1.id, locked.id, otherInspector.id, good2.id],
     inspectorName: "李四",
   });
   assert.equal(r.status, 409);
   assert.equal(r.json.error, "batch_aborted");
   assert.equal(r.json.rolledBack, true);
   const problemIds = r.json.problems.map((p) => p.id).sort();
-  assert.deepEqual(problemIds, [locked.id, "missing-id", otherInspector.id].sort());
+  assert.deepEqual(problemIds, [locked.id, otherInspector.id].sort());
 
   // 两根好索必须仍未确认（无半批）
   for (const x of [good1, good2]) {
