@@ -20,3 +20,6 @@ Thumbs.db
 
 .vscode/
 .idea/
+
+data/knot-acceptance.json
+tests/screenshots/FAIL-*.png
